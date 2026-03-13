@@ -67,13 +67,6 @@ export interface BaseClickHouseClientConfigOptions {
     LoggerClass?: new () => Logger
     /** @default set to {@link ClickHouseLogLevel.WARN} */
     level?: ClickHouseLogLevel
-    /**
-     * If set to `true`, the client will log unredacted queries.
-     * If set to `false` (default), the client will not attempt to log queries at all.
-     *
-     * @default false
-     */
-    unsafeLogUnredactedQueries?: boolean
   }
   /** ClickHouse Session id to attach to the outgoing requests.
    *  @default empty string (no session) */
@@ -100,6 +93,13 @@ export interface BaseClickHouseClientConfigOptions {
    * Defaults to using standard `JSON.parse` and `JSON.stringify`
    */
   json?: Partial<JSONHandling>
+  /** When true, query() sends query_params as multipart/form-data parts
+   *  instead of URL query string entries. This avoids HTTP URL length limits
+   *  when query parameters contain large arrays (25K+ values).
+   *  The SQL query is also moved into a multipart part named "query".
+   *  All other URL search params (database, query_id, settings, etc.) remain in the URL.
+   *  @default false */
+  use_multipart_params?: boolean
 }
 
 export type MakeConnection<
@@ -261,7 +261,6 @@ export function getConnectionParams(
     database: config.database ?? 'default',
     log_writer: new LogWriter(logger, 'Connection', log_level),
     log_level: log_level,
-    unsafeLogUnredactedQueries: config.log?.unsafeLogUnredactedQueries ?? false,
     keep_alive: { enabled: config.keep_alive?.enabled ?? true },
     clickhouse_settings: config.clickhouse_settings ?? {},
     http_headers: config.http_headers ?? {},
@@ -269,6 +268,7 @@ export function getConnectionParams(
       ...defaultJSONHandling,
       ...config.json,
     },
+    ...(config.use_multipart_params ? { use_multipart_params: true } : {}),
   }
 }
 

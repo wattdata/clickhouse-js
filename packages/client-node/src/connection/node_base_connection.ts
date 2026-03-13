@@ -16,6 +16,8 @@ import type {
   ResponseHeaders,
 } from '@clickhouse/client-common'
 import {
+  buildMultipartBody,
+  formatQueryParams,
   enhanceStackTrace,
   getCurrentStackTrace,
   isCredentialsAuth,
@@ -37,7 +39,7 @@ import Stream from 'stream'
 import Zlib from 'zlib'
 import { getAsText, getUserAgent, isStream } from '../utils'
 import { decompressResponse, isDecompressionError } from './compression'
-import { drainStream } from './stream'
+import { drainStreamInternal } from './stream'
 
 export type NodeConnectionParams = ConnectionParams & {
   tls?: TLSParams
@@ -89,7 +91,6 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
 
   private readonly jsonHandling: JSONHandling
   private readonly knownSockets = new WeakMap<net.Socket, SocketInfo>()
-  private readonly idleSocketTTL: number
   private readonly connectionId: string = crypto.randomUUID()
   private socketCounter = 0
   // For overflow concerns:
@@ -126,7 +127,6 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       Connection: this.params.keep_alive.enabled ? 'keep-alive' : 'close',
       'User-Agent': getUserAgent(this.params.application_id),
     }
-    this.idleSocketTTL = params.keep_alive.idle_socket_ttl
     this.jsonHandling = params.json ?? {
       parse: JSON.parse,
       stringify: JSON.stringify,
@@ -137,8 +137,8 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
     const { log_writer, log_level } = this.params
     const query_id = this.getQueryId(params.query_id)
     const { controller, controllerCleanup } = this.getAbortController(params)
-    let result: RequestResult
     try {
+      let result: RequestResult
       if (params.select) {
         const searchParams = toSearchParams({
           database: undefined,
@@ -147,9 +147,9 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
         })
         result = await this.request(
           {
+            query: PingQuery,
             method: 'GET',
             url: transformUrl({ url: this.params.url, searchParams }),
-            query: PingQuery,
             abort_signal: controller.signal,
             headers: this.buildRequestHeaders(),
             query_id,
@@ -161,11 +161,11 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       } else {
         result = await this.request(
           {
+            query: 'ping',
             method: 'GET',
             url: transformUrl({ url: this.params.url, pathname: '/ping' }),
             abort_signal: controller.signal,
             headers: this.buildRequestHeaders(),
-            query: 'ping',
             query_id,
             log_writer,
             log_level,
@@ -173,7 +173,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
           'Ping',
         )
       }
-      await drainStream(
+      await drainStreamInternal(
         {
           op: 'Ping' as const,
           log_writer,
@@ -216,9 +216,16 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       params.clickhouse_settings,
       this.params.compression.decompress_response,
     )
+
+    const useMultipart =
+      (params.use_multipart_params ?? this.params.use_multipart_params) &&
+      params.query_params !== undefined &&
+      Object.keys(params.query_params).length > 0
+
     const searchParams = toSearchParams({
       database: this.params.database,
-      query_params: params.query_params,
+      // When using multipart, query_params are sent in the multipart body
+      query_params: useMultipart ? undefined : params.query_params,
       session_id: params.session_id,
       clickhouse_settings,
       query_id,
@@ -228,15 +235,28 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
     // allows enforcing the compression via the settings even if the client instance has it disabled
     const enableResponseCompression =
       clickhouse_settings.enable_http_compression === 1
+
+    let body: string = params.query
+    const headers = this.buildRequestHeaders(params)
+    if (useMultipart && params.query_params !== undefined) {
+      const boundary = `----clickhouse-js-${crypto.randomUUID()}`
+      const parts: Record<string, string> = { query: params.query }
+      for (const [key, value] of Object.entries(params.query_params)) {
+        parts[`param_${key}`] = formatQueryParams({ value })
+      }
+      body = buildMultipartBody(parts, boundary)
+      headers['Content-Type'] = `multipart/form-data; boundary=${boundary}`
+    }
+
     try {
       const { response_headers, stream, http_status_code } = await this.request(
         {
           method: 'POST',
           url: transformUrl({ url: this.params.url, searchParams }),
-          body: params.query,
+          body,
           abort_signal: controller.signal,
           enable_response_compression: enableResponseCompression,
-          headers: this.buildRequestHeaders(params),
+          headers,
           query: params.query,
           query_id,
           log_writer,
@@ -303,7 +323,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
           },
           'Insert',
         )
-      await drainStream(
+      await drainStreamInternal(
         {
           op: 'Insert',
           log_writer,
@@ -353,9 +373,6 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
           operation: 'Command',
           connection_id: this.connectionId,
           query_id,
-          query: this.params.unsafeLogUnredactedQueries
-            ? params.query
-            : undefined,
         },
       })
     }
@@ -386,7 +403,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
 
     // ignore the response stream and release the socket immediately
     const drainStartTime = Date.now()
-    await drainStream(
+    await drainStreamInternal(
       {
         op: 'Command',
         log_writer,
@@ -495,17 +512,9 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
     err,
     query_id,
     query_params,
-    search_params,
     extra_args,
   }: LogRequestErrorParams) {
     if (this.params.log_level <= ClickHouseLogLevel.ERROR) {
-      // Redact query parameter from search params unless explicitly allowed
-      if (!this.params.unsafeLogUnredactedQueries && search_params) {
-        // Clone to avoid mutating the original search params
-        search_params = new URLSearchParams(search_params)
-        search_params.delete('query')
-      }
-
       this.params.log_writer.error({
         message: this.httpRequestErrorMessage(op),
         err: err as Error,
@@ -513,10 +522,6 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
           operation: op,
           connection_id: this.connectionId,
           query_id,
-          query: this.params.unsafeLogUnredactedQueries
-            ? query_params.query
-            : undefined,
-          search_params: search_params?.toString(),
           with_abort_signal: query_params.abort_signal !== undefined,
           session_id: query_params.session_id,
           ...extra_args,
@@ -648,10 +653,63 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       const request = this.createClientRequest(params)
       const request_id = this.getNewRequestId()
 
-      function onError(e: Error): void {
+      const onError = (e: unknown): void => {
         removeRequestListeners()
-        const err = enhanceStackTrace(e, currentStackTrace)
-        reject(err)
+        if (e instanceof Error) {
+          if (log_level <= ClickHouseLogLevel.TRACE) {
+            if ((e as any).code === 'ECONNRESET') {
+              log_writer.trace({
+                message: `${op}: connection reset by peer`,
+                args: {
+                  operation: op,
+                  connection_id: this.connectionId,
+                  query_id,
+                  request_id,
+                },
+                module: 'HTTP Adapter',
+              })
+            }
+          }
+          if (log_level <= ClickHouseLogLevel.WARN) {
+            if (this.params.keep_alive.enabled) {
+              if ((e as any).code === 'ECONNRESET') {
+                const socket = request.socket
+                if (socket) {
+                  const socketInfo = this.knownSockets.get(socket)
+                  if (socketInfo) {
+                    const serverTimeoutMs =
+                      socketInfo.server_keep_alive_timeout_ms
+                    if (serverTimeoutMs !== undefined) {
+                      if (
+                        this.params.keep_alive.idle_socket_ttl > serverTimeoutMs
+                      ) {
+                        log_writer.warn({
+                          message: `${op}: idle socket TTL is greater than server keep-alive timeout, try setting idle socket TTL to a value lower than the server keep-alive timeout to prevent unexpected connection resets, see https://c.house/js_keep_alive_econnreset for more details.`,
+                          args: {
+                            operation: op,
+                            connection_id: this.connectionId,
+                            query_id,
+                            request_id,
+                            socket_id: socketInfo.id,
+                            server_keep_alive_timeout_ms: serverTimeoutMs,
+                            idle_socket_ttl:
+                              this.params.keep_alive.idle_socket_ttl,
+                          },
+                          module: 'HTTP Adapter',
+                        })
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          const err = enhanceStackTrace(e, currentStackTrace)
+          reject(err)
+        } else {
+          reject(e)
+        }
       }
 
       let responseStream: Stream.Readable
@@ -659,18 +717,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
         _response: Http.IncomingMessage,
       ): Promise<void> => {
         if (this.params.log_level <= ClickHouseLogLevel.DEBUG) {
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          const { authorization, host, ...headers } = request.getHeaders()
           const duration = Date.now() - start
-
-          // Redact query parameter from URL search params unless explicitly allowed
-          let searchParams = params.url.searchParams
-          if (!this.params.unsafeLogUnredactedQueries) {
-            // Clone to avoid mutating the original search params
-            searchParams = new URLSearchParams(searchParams)
-            searchParams.delete('query')
-          }
-
           this.params.log_writer.debug({
             module: 'HTTP Adapter',
             message: `${op}: got a response from ClickHouse`,
@@ -681,13 +728,40 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
               request_id,
               request_method: params.method,
               request_path: params.url.pathname,
-              request_params: searchParams.toString(),
-              request_headers: headers,
               response_status: _response.statusCode,
-              response_headers: _response.headers,
               response_time_ms: duration,
             },
           })
+        }
+
+        if (this.params.keep_alive.enabled) {
+          const keepAliveHeader = _response.headers['keep-alive']
+          if (keepAliveHeader) {
+            const [, timeout] =
+              /timeout=(\d+)/i.exec(String(keepAliveHeader)) ?? []
+
+            if (timeout) {
+              const socketInfo = this.knownSockets.get(_response.socket)
+              if (socketInfo) {
+                const timeoutMs = Number(timeout) * 1000
+                socketInfo.server_keep_alive_timeout_ms = timeoutMs
+                if (log_level <= ClickHouseLogLevel.TRACE) {
+                  this.params.log_writer.trace({
+                    module: 'HTTP Adapter',
+                    message: `${op}: updated server sent socket keep-alive timeout`,
+                    args: {
+                      operation: op,
+                      connection_id: this.connectionId,
+                      query_id,
+                      request_id,
+                      socket_id: socketInfo.id,
+                      server_keep_alive_timeout_ms: timeoutMs,
+                    },
+                  })
+                }
+              }
+            }
+          }
         }
 
         const tryDecompressResponseStream =
@@ -839,7 +913,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
               }
               this.knownSockets.set(socket, newSocketInfo)
               // When the request is complete and the socket is released,
-              // make sure that the socket is removed after `idleSocketTTL`.
+              // make sure that the socket is removed after `idle_socket_ttl`.
               socket.on('free', () => {
                 if (log_level <= ClickHouseLogLevel.TRACE) {
                   log_writer.trace({
@@ -865,13 +939,14 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
                         query_id,
                         request_id,
                         socket_id,
-                        idle_socket_ttl_ms: this.idleSocketTTL,
+                        idle_socket_ttl_ms:
+                          this.params.keep_alive.idle_socket_ttl,
                       },
                     })
                   }
                   this.knownSockets.delete(socket)
                   socket.destroy()
-                }, this.idleSocketTTL).unref()
+                }, this.params.keep_alive.idle_socket_ttl).unref()
                 newSocketInfo.idle_timeout_handle = idleTimeoutHandle
               })
 
@@ -909,9 +984,6 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
                         request_id,
                         socket_id,
                         event: eventName,
-                        query: this.params.unsafeLogUnredactedQueries
-                          ? params.query
-                          : undefined,
                       },
                     })
                   }
@@ -1053,7 +1125,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       }
 
       function removeRequestListeners(): void {
-        if (request.socket !== null) {
+        if (request.socket) {
           request.socket.setTimeout(0) // reset previously set timeout
           request.socket.removeListener('timeout', onTimeout)
         }
@@ -1061,7 +1133,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
         request.removeListener('response', onResponse)
         request.removeListener('error', onError)
         request.removeListener('close', onClose)
-        if (params.abort_signal !== undefined) {
+        if (params.abort_signal) {
           request.removeListener('abort', onAbort)
         }
       }
@@ -1071,7 +1143,7 @@ export abstract class NodeBaseConnection implements Connection<Stream.Readable> 
       request.on('error', onError)
       request.on('close', onClose)
 
-      if (params.abort_signal !== undefined) {
+      if (params.abort_signal) {
         params.abort_signal.addEventListener('abort', onAbort, {
           once: true,
         })
@@ -1119,6 +1191,7 @@ interface SocketInfo {
   id: string
   idle_timeout_handle: ReturnType<typeof setTimeout> | undefined
   usage_count: number
+  server_keep_alive_timeout_ms?: number
 }
 
 type RunExecParams = ConnBaseQueryParams & {
